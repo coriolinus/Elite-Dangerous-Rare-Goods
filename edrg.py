@@ -6,11 +6,13 @@ import re
 import os
 import xlrd           # read the excel source data file
 from contextlib import contextmanager
+from math import exp
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, Index, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Float, Index, ForeignKey, func
+from sqlalchemy.sql.expression import asc, desc
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.ext.hybrid import hybrid_property, hybrid_method
 from sqlalchemy.exc import IntegrityError
 
 #base class for ORM objects
@@ -53,9 +55,14 @@ class System(Base):
 	
 	stations = relationship("Station", backref="system")
 	
+#	@hybrid_method
 	def distanceTo(self, other):
 		return (((self.x - other.x) ** 2) + ((self.y - other.y) ** 2) + ((self.z - other.z) ** 2)) ** .5
-		
+	
+#	@distanceTo.expression      # THIS DOESN'T WORK BECAUSE SQLITE DOESN'T HAVE THE POWER() FUNCTION
+#	def distanceTo(cls, other):
+#		return func.power(func.power(cls.x-other.x,2)+func.power(cls.y-other.y,2)+func.power(cls.z-other.z,2),.5)
+	
 	@classmethod
 	def import_(cls, sheet, session):
 		"""
@@ -134,7 +141,11 @@ class Goods(Base):
 	
 	@hybrid_property
 	def expected_supply(self):
-		return (self.min_supply + self.max_supply) // 2
+		return round((self.min_supply + self.max_supply) / 2)
+	
+	@expected_supply.expression
+	def expected_supply(cls):
+		return func.round((cls.min_supply + cls.max_supply) / 2)
 	
 	@hybrid_property
 	def min_value(self):
@@ -196,7 +207,8 @@ class Goods(Base):
 		session.add(Goods(station=station, name=name, max_cap=max_cap, min_supply=min_supply, max_supply=max_supply, price=price))
 		
 	def __str__(self):
-		return "{} ({}, {}): {}".format(self.name, self.station.name, self.station.system.name, self.expected_value)
+		ev = self.expected_value
+		return "{} ({}, {}): {}".format(self.name, self.station.name, self.station.system.name, ev)
 	
 def import_data_from_excel(path="elite dangerous rare goods.xlsx"):
 	with xlrd.open_workbook(path) as book:
@@ -219,6 +231,7 @@ def strip(str):
 	return str.strip() # forgot it was a method
 	
 def tquery(q):
+	"Convience method to get a scoped query"
 	with session_scope() as session:
 		return session.query(q)
 	
@@ -241,6 +254,52 @@ def get_cell_value(sheet, address, rcformat=False):
 	col -= 1 #xlrd indexes its cols from 0, and Excel from 1
 	return sheet.cell_value(row, col)
 	
+def sale_price(good, destination, p1=16000, p2=0.0677, p3=101):
+	"""
+	The accepted formula for sale price of a rare good in this game:
+	
+	    SP(x) = p0 + p1 /  ( 1.0 + exp( - ( p2 * ( x – p3 ) ) ) )
+		
+	OK, so what are these numbers?
+	
+	Guessing here based on forum speculation:
+		p0 : purchase price / 2
+		p1 : variable per item; related to the maximal sale price. We don't know this, so we use 
+		     an estimate of 16000, which is close enough 
+		p2 : galactic constant of approximately 0.0677
+		p3 : galactic constant of approximately 101
+		
+	ref: https://forums.frontier.co.uk/showthread.php?t=66538
+	"""
+	
+	dist = good.station.system.distanceTo(destination)
+	return (good.price / 2) + (p1 / (1.0 + exp( - (p2 * (dist - p3)))))
+	
+def optimize(goods, outputs=1, max_dist=None):
+	"""
+	Accepts a list of goods. Returns the pair with the highest round-trip profit.
+	"""
+	
+	results = []
+	while len(goods) > 0:
+		origin = goods.pop(0)
+		for destination in goods:
+			dist = origin.station.system.distanceTo(destination.station.system)
+			if max_dist is not None and dist <= max_dist:
+				profit_out = origin.expected_supply * (sale_price(origin, destination.station.system) - origin.price)
+				profit_back = destination.expected_supply * (sale_price(destination, origin.station.system) - destination.price)
+				rt_profit = profit_out + profit_back
+				results.append((rt_profit, origin, destination, dist))
+	
+	results.sort(key=lambda ptuple: -ptuple[0]) #sorting by negative profit gives us the highest profits first
+	
+	for r in range(outputs):
+		profit, origin, destination, dist = results.pop(0)
+		print("Optimal route: "+ str(origin))
+		print(" and " + str(destination))
+		print(" at a distance of {:.2f} Ly with round-trip expected profit {:.0f}".format(dist, profit))
+		print()
+	
 if __name__ == '__main__':
 	import argparse
 	
@@ -251,12 +310,21 @@ if __name__ == '__main__':
 		help="Return the number of goods meeting the specified criteria")
 	parser.add_argument('-d', '--display', action='store_true', default=False,
 		help="Display the names of all goods meeting the specified criteria")
-	parser.add_argument('-l', '--limit', action='store', default=-1, type=int,
-		help="Act on only the first LIMIT results")
 	parser.add_argument('-o', '--optimize', action='store_true', default=False,
 		help="Compute and display the optimal route given the specified criteria")
+	parser.add_argument('--optimize-outputs', action='store', default=1, type=int, metavar='N',
+		help="Modifies --optimize: show the top N optimization outputs. Default 1")
+	parser.add_argument('--max-dist', action='store', type=int,
+		help="Modifies --optimize: the maximal distance you'll accept for a route")
+	parser.add_argument('-l', '--limit', action='store', default=-1, type=int, metavar='N',
+		help="Limit to the first N SQL results. This happens before optimization!")
 	parser.add_argument('-f', '--filter', action='append', default=[],
-		help="Raw SQLAlchemy code to filter by")
+		help="Raw SQLAlchemy filter strings. You have access to Goods, Station, and System.")
+	parser.add_argument('-s', '--sort', action='store', 
+		help="Raw SQLAlchemy order_by string. Sorts descending by default. You have access to Goods, Station, and System.")
+	parser.add_argument('-a', '--ascending', action='store_true', default=False,
+		help="Modifies --sort to produce an ascending sort instead.")
+	
 		
 	ns = parser.parse_args()
 	
@@ -267,18 +335,29 @@ if __name__ == '__main__':
 		with session_scope() as session:
 			q = session.query(Goods).join(Station).join(System)
 			
+			# filters need to be eval'd for hybrid properties to work. Do it safely, though:
+			gbs = {'__builtins__':None}
+			lcs = {'Goods':Goods, 'Station':Station, 'System':System}
 			for filter in ns.filter:
-				q = q.filter(filter)
+				q = q.filter(eval(filter, gbs, lcs))
 			
 			if ns.count:
 				print(q.count())
 				print()
 			
+			if ns.sort is not None:
+				order = asc if ns.ascending else desc
+				q = q.order_by(order(eval(ns.sort, gbs, lcs)))
+				
 			if ns.limit != -1:
 				q = q.limit(ns.limit)
 			
 			if ns.display:
 				for result in q.all():
 					print(str(result))
+				print()
+				
+			if ns.optimize:
+				optimize(q.all(), ns.optimize_outputs, ns.max_dist)
 	
 	#TODO: work on the optimization logic, which after all was the whole point
