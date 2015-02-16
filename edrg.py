@@ -1,5 +1,6 @@
+#!/usr/bin/python3
 """
-edrg.py -- collection of utilities 
+edrg.py -- route planner for Rare Goods in Elite: Dangerous
 """
 
 import re
