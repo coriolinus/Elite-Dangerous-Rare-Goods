@@ -276,7 +276,7 @@ def sale_price(good, destination, p1=16000, p2=0.0677, p3=101):
 	dist = good.station.system.distanceTo(destination)
 	return (good.price / 2) + (p1 / (1.0 + exp( - (p2 * (dist - p3)))))
 	
-def optimize(goods, outputs=1, max_dist=None):
+def optimize(goods, outputs=1, max_dist=None, max_cargo=None):
 	"""
 	Accepts a list of goods. Returns the pair with the highest round-trip profit.
 	"""
@@ -286,9 +286,15 @@ def optimize(goods, outputs=1, max_dist=None):
 		origin = goods.pop(0)
 		for destination in goods:
 			dist = origin.station.system.distanceTo(destination.station.system)
-			if max_dist is not None and dist <= max_dist:
-				profit_out = origin.expected_supply * (sale_price(origin, destination.station.system) - origin.price)
-				profit_back = destination.expected_supply * (sale_price(destination, origin.station.system) - destination.price)
+			if max_dist is None or dist <= max_dist:
+				if max_cargo is None:
+					oes = origin.expected_supply
+					des = destination.expected_supply
+				else:
+					oes = origin.expected_supply if origin.expected_supply <= max_cargo else max_cargo
+					des = destination.expected_supply if destination.expected_supply <= max_cargo else max_cargo
+				profit_out  = oes * (sale_price(origin, destination.station.system) - origin.price)
+				profit_back = des * (sale_price(destination, origin.station.system) - destination.price)
 				rt_profit = profit_out + profit_back
 				results.append((rt_profit, origin, destination, dist))
 	
@@ -317,6 +323,8 @@ if __name__ == '__main__':
 		help="Modifies --optimize: show the top N optimization outputs. Default 1")
 	parser.add_argument('--max-dist', action='store', type=int,
 		help="Modifies --optimize: the maximal distance you'll accept for a route")
+	parser.add_argument('--limit-cargo', action='store', type=int, metavar='C',
+		help="Modifies --optimize: calculate using at most C units of cargo, if the expected supply is greater")
 	parser.add_argument('-l', '--limit', action='store', default=-1, type=int, metavar='N',
 		help="Limit to the first N SQL results. This happens before optimization!")
 	parser.add_argument('-f', '--filter', action='append', default=[],
@@ -359,6 +367,6 @@ if __name__ == '__main__':
 				print()
 				
 			if ns.optimize:
-				optimize(q.all(), ns.optimize_outputs, ns.max_dist)
+				optimize(q.all(), ns.optimize_outputs, ns.max_dist, ns.limit_cargo)
 	
 	#TODO: work on the optimization logic, which after all was the whole point
